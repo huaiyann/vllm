@@ -29,6 +29,7 @@ from functools import lru_cache, partial
 from itertools import islice
 from typing import Any
 
+import time, traceback
 import numpy as np
 import torch
 import torch.nn as nn
@@ -140,6 +141,7 @@ from .vision import (
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
 )
+from PIL.JpegImagePlugin import JpegImageFile
 
 logger = init_logger(__name__)
 
@@ -366,6 +368,20 @@ class Qwen3_VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # forward过程解析
+        # 1. 假设输入的x.shape = L, C = [3776, 1536]
+        # x的dim=1(1536)是把一个像素的数据给铺平了
+        # 2. 先通过这个还原之前的像素结构：x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
+        # 还原为[3776, 3, 2, 16, 16]
+        # 其中3是从入参-1自动推导出来的，对应in_channels（rgb通道数）
+        # temporal_patch_size=2，表示取时间上的连续两帧一起处理（为了处理视频），但是为了统一架构和简化代码，静态图片也伪造成了2帧的视频
+        # 注意这个静态图片伪造2帧视频的处理，只在embeding这里有额外开销，并不影响后续的transformer计算，因为下面紧接着就把patch压缩为一个固定size的向量了
+        # patch_size=16 每个像素patch的宽高为16像素
+        # 3. 执行卷积计算self.proj(x)，进行升维和降维（对齐权重维度）
+        # 得到了[3776, 1024, 1, 1, 1]。其中channel数从3升维到hidden_size=1024，时空维度（2*16*16）被压缩降维成[1, 1, 1]
+        # 4. 最后调整观测维度（view(L, self.hidden_size)），变成[3776, 1024]
+        # 本身底层数据就是超长的序列，view只是改变了观测的方式，只要保证view前后的数据量一致就能通过
+
         L, C = x.shape
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
         x = self.proj(x).view(L, self.hidden_size)
@@ -504,6 +520,9 @@ class Qwen3_VisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # merger的hidden_size是context_dim * spatial_merge_size^2
+        # view(-1, self.hidden_size)会把向量spatial_merge_size^2个合并为1个
+        # 如[3776, 1, 1024]转为[944, 4096]
         if self.use_postshuffle_norm:
             x = self.norm(x.view(-1, self.hidden_size))
         else:
@@ -511,6 +530,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
 
         x_parallel, _ = self.linear_fc1(x)
         x_parallel = self.act_fn(x_parallel)
+        # 注意linear_fc2的output维度是d_model，也就是vision config的out_hidden_size
         out, _ = self.linear_fc2(x_parallel)
         return out
 
@@ -787,6 +807,7 @@ class Qwen3_VisionTransformer(nn.Module):
         *,
         encoder_metadata: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        # embedding和卷积计算，将每个像素patch计算为hidden_size的1维向量
         hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         hidden_states = self.patch_embed(hidden_states)
 
@@ -818,6 +839,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 )
                 deepstack_feature_lists.append(deepstack_feature)
         hidden_states = self.merger(hidden_states)
+        # qwen3.5 4b没有deepstack_feature_lists，这行没起作用。本来是要dim=1维度的向量变长
         hidden_states = torch.cat(
             [hidden_states] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
@@ -1325,20 +1347,37 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             mm_kwargs=mm_kwargs,
             tok_kwargs=tok_kwargs,
         )
+
+        # 新增pixel_masks计算。注意需要注册才能被scheduler顺利传递（在下面的_get_mm_fields_config）
+        # 剪枝逻辑：pixel_values的像素值已经按0-255做了归一化，剪枝时粗暴处理，只剪掉全为1的纯白patch
+        pixel_values = processed_outputs.get("pixel_values")
+        if pixel_values is not None:
+            pixel_masks = (pixel_values == 1).all(dim=1)
+            processed_outputs["pixel_masks"] = pixel_masks
+
         combined_outputs = dict(
             processed_outputs,
             **video_outputs,
         )
         return BatchFeature(combined_outputs)
 
+    # 需要改这个字段注册函数，新的pixel_mask才能顺利进入scheduler
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return _create_qwen2vl_field_factory(
+        # 原本的字段注册
+        fields = _create_qwen2vl_field_factory(
             self.info.get_hf_config().vision_config.spatial_merge_size
         )(hf_inputs)
+        # 注册新字段，具体参数参考了_create_qwen2vl_field_factory中的pixel_values
+        image_grid_thw = hf_inputs.get("image_grid_thw", torch.empty((0, 3)))
+        image_pixel_grid_sizes = image_grid_thw.prod(-1)
+        fields["pixel_masks"] = MultiModalFieldConfig.flat_from_sizes(
+                "image", image_pixel_grid_sizes
+        )
+        return fields
 
     def _get_prompt_updates(
         self,
@@ -1361,8 +1400,14 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             out_item = out_mm_kwargs["image"][item_idx]
             grid_thw = out_item["image_grid_thw"].data
             assert isinstance(grid_thw, torch.Tensor)
-
-            num_tokens = int(grid_thw.prod()) // merge_length
+            # 这里生成的是图片token在最终token ids中的占位符
+            if "pixel_masks" not in out_item:
+                num_tokens = int(grid_thw.prod()) // merge_length
+            else:
+                # 剪枝的情况下需要重新计算占位符数量，和剪枝后的id数量一致
+                pixel_masks = out_item["pixel_masks"].data.view(grid_thw.prod() // merge_length, -1)
+                # 剪枝后剩余的id数量，为pixel_masks中不全为true的dim=1的数量
+                num_tokens = (~pixel_masks.all(dim=1)).sum().item()
             return [hf_processor.image_token_id] * num_tokens
 
         def get_video_replacement_qwen3vl(item_idx: int):
@@ -2004,6 +2049,7 @@ class Qwen3VLForConditionalGeneration(
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
+        pixel_masks = kwargs.pop("pixel_masks", None)
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -2013,6 +2059,7 @@ class Qwen3VLForConditionalGeneration(
                 type="pixel_values",
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                pixel_masks=pixel_masks,
             )
 
         if image_embeds is not None:
@@ -2056,11 +2103,15 @@ class Qwen3VLForConditionalGeneration(
     ) -> tuple[torch.Tensor, ...]:
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
+        pixel_masks = None
 
         if image_input["type"] == "image_embeds":
+            # TODO 貌似PD分离和cache命中时会触发这里？需要额外处理？
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+            if image_input["pixel_masks"] is not None:
+                pixel_masks = image_input["pixel_masks"].type(self.visual.dtype)
             if self.use_data_parallel:
                 return run_dp_sharded_mrope_vision_model(
                     self.visual, pixel_values, grid_thw.tolist(), rope_type="rope_3d"
@@ -2071,7 +2122,20 @@ class Qwen3VLForConditionalGeneration(
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
         sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
-        return image_embeds.split(sizes)
+        # image_embeds是所有图片的embedding结果，需要拆分成单个图片的
+        embeds_per_image = image_embeds.split(sizes)
+        if pixel_masks is not None:
+            # 1. pixel_masks形状和embeds对齐
+            pixel_masks = pixel_masks.view(image_embeds.shape[0], -1)
+            # 2. pixel_masks也要拆成单张图片的
+            masks_per_image = pixel_masks.split(sizes)
+            # 3. 针对每一张图片，独立进行剪枝操作，获得新embeds_list
+            filtered_embeds_list = []
+            for embeds, masks in zip(embeds_per_image, masks_per_image):
+                # 保留masks中不是全为true的
+                filtered_embeds_list.append(embeds[~masks.all(dim=1)])
+            embeds_per_image = filtered_embeds_list
+        return embeds_per_image
 
     def _process_video_input(
         self, video_input: Qwen2_5_VLVideoInputs

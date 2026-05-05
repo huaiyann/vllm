@@ -1,0 +1,19 @@
+FROM nvidia/cuda:13.1.1-cudnn-devel-ubuntu22.04 as base
+
+
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    vim \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /code
+RUN cd /code && /root/.local/bin/uv venv --python 3.12 --seed --managed-python
+# source .venv/bin/activate
+# git config --global --add safe.directory /code/vllm
+# VLLM_USE_PRECOMPILED=1 uv pip install --editable . --torch-backend=auto
