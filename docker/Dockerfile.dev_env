@@ -17,3 +17,6 @@ RUN cd /code && /root/.local/bin/uv venv --python 3.12 --seed --managed-python
 # source .venv/bin/activate
 # git config --global --add safe.directory /code/vllm
 # VLLM_USE_PRECOMPILED=1 uv pip install --editable . --torch-backend=auto
+# uv pip install -r ./requirements/self.txt --torch-backend=auto -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# docker run --gpus all --network host -d -it --name vllm_dev_official -v /home/hynes/codespace/vllm_official:/code/vllm vllm_dev_env:1.0.0 /bin/bash

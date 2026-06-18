@@ -819,7 +819,7 @@ class Qwen3_VisionTransformer(nn.Module):
             encoder_metadata = self.prepare_encoder_metadata(grid_thw_list)
 
         pos_embeds = encoder_metadata["pos_embeds"]
-        hidden_states = hidden_states + pos_embeds
+        hidden_states = hidden_states + pos_embeds # 绝对位置编码融合
         hidden_states = hidden_states.unsqueeze(1)
 
         deepstack_feature_lists = []
@@ -827,7 +827,7 @@ class Qwen3_VisionTransformer(nn.Module):
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=encoder_metadata["cu_seqlens"],
-                rotary_pos_emb_cos=encoder_metadata["rotary_pos_emb_cos"],
+                rotary_pos_emb_cos=encoder_metadata["rotary_pos_emb_cos"], # 3D旋转位置编码融合在block计算中
                 rotary_pos_emb_sin=encoder_metadata["rotary_pos_emb_sin"],
                 max_seqlen=encoder_metadata["max_seqlen"],
                 sequence_lengths=encoder_metadata.get("sequence_lengths"),
