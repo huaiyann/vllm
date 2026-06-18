@@ -534,7 +534,9 @@ class Platform:
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
         # Compute attention page size for 1 token
+        # 计算一个token占多少字节
         if model_config.use_mla:
+            # deepseek引入的 Multi-head Latent Attention
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
@@ -550,8 +552,10 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
+        # logger.info(f'get attn_page_size_1_token {attn_page_size_1_token}')
 
         # Compute mamba page size
+        # 计算mamba层的一页占多少字节，用具体模型类的实现来获得shapes和dtypes
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture,
             model_config=model_config,
@@ -561,6 +565,7 @@ class Platform:
             dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
             block_size=-1,
         ).page_size_bytes
+        # logger.info(f'get mamba_page_size {mamba_page_size} from shapes {model_cls.get_mamba_state_shape_from_config(vllm_config)} and dtypes {model_cls.get_mamba_state_dtype_from_config(vllm_config)} and model class {model_cls.__class__}')
 
         if mamba_page_size == 0:
             return
@@ -573,15 +578,23 @@ class Platform:
         )
 
         # Get kernel block alignment from the backend's supported sizes
+        # 计算在执行注意力机制（Attention）GPU算子时，所需的“内核块对齐大小（单位是token）”（Kernel Block Alignment Size）
+        # 在 vLLM 中，显存管理采用了 PagedAttention（将 KV Cache 分块存储）。为了让底层的 GPU 加速算子（比如 FlashAttention、XFormers 或 Triton 编写的 kernel）能够最高效地运行，传入的数据长度必须满足一定的对齐要求（通常是 2 的幂次方，比如 16、32、64）
+        # 在满足 GPU 底层算子最小粒度要求的前提下，确保数据对齐大小能够完美包容物理 KV Cache 的块大小
         with set_current_vllm_config(vllm_config):
-            kernel_block_alignment_size = max(
-                min(
+            kernel_block_alignment_size = max( # 最后在算子size和cache size直接取max作为算子size，确保算子size能包容cache size
+                min( # 提取底层算子支持的大小，并最终取min（size越小，推理时padding的消化越小）
                     s.base if isinstance(s, MultipleOf) else s
                     for s in backend_cls.get_supported_kernel_block_sizes()
                 ),
                 cache_config.block_size,
             )
+        kernel_sizes = (s.base if isinstance(s, MultipleOf) else s
+                        for s in backend_cls.get_supported_kernel_block_sizes())
+        # logger.info(f'get kernel_block_alignment_size = {kernel_block_alignment_size} from kernel_sizes {kernel_sizes} and cache_block_size {cache_config.block_size}')
 
+
+        # logger.info(f'mamba_cache_mode {cache_config.mamba_cache_mode}')
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
             # TODO(tdoublep): this constraint can be relaxed fairly
@@ -596,10 +609,17 @@ class Platform:
         else:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
+            # cdiv是vllm实现的向上取整除法（利用负数和python自带的向下取整：-(a // -b)）
+            # kernel_block_alignment_size * attn_page_size_1_token：算子的一个block总共占用多少个字节
+            # mamba_page_size：mamba层的一页（一个mamba状态块）占多少字节
+            # 做向上取整：mamba的一页需要多少个block才能放下
+            # 再乘上kernel_block_alignment_size（一个block的token数）
+            # 最终获得一个能安全放下mamba页的token数，作为attention block size
             attn_block_size = kernel_block_alignment_size * cdiv(
                 mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
+            # logger.info(f'attn_block_size: {attn_block_size} calculated from kernel_block_alignment_size: {kernel_block_alignment_size}, mamba_page_size: {mamba_page_size}, attn_page_size_1_token: {attn_page_size_1_token}')
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size
